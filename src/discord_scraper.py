@@ -22,39 +22,10 @@ from .transformer import MediaTransformer
 from .utils import sanitize_filename, unlink_quiet
 from .db import Store
 
-# ========== UNICODE LOGGING FIX ==========
-_USE_ASCII_FALLBACK = False
-
-if sys.platform == "win32":
-    try:
-        import os
-        os.environ['PYTHONIOENCODING'] = 'utf-8'
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        _USE_ASCII_FALLBACK = True
-
-
-def log_safe(logger_func, message: str):
-    if sys.platform == "win32" or _USE_ASCII_FALLBACK:
-        replacements = {
-            '✓': '[OK]', '✔': '[OK]', '✗': '[FAIL]', '❌': '[FAIL]',
-            '⚠': '[WARN]', '❗': '[!]', '📨': '[MSG]', '📜': '[HIST]',
-            '🔄': '[POLL]', '📊': '[STATS]', '📚': '[BACKFILL]',
-            '🛑': '[STOP]', 'ℹ': '[INFO]', '✅': '[OK]', '🔁': '[RETRY]',
-        }
-        for emoji, ascii_rep in replacements.items():
-            message = message.replace(emoji, ascii_rep)
-    try:
-        logger_func(message)
-    except UnicodeEncodeError:
-        logger_func(message.encode('ascii', errors='replace').decode('ascii'))
-
-
+# ---------- Unicode safe logging ----------
 logger = logging.getLogger(__name__)
 
-
-# ---------- JavaScript extraction (injected once) ----------
+# ---------- JavaScript extraction (unchanged) ----------
 _EXTRACT_JS = r"""
 () => {
     const CDN_HOSTS = [
@@ -198,7 +169,7 @@ class DiscordScraper:
         headless: bool = False,
         start_date: str | None = None,
         store: Optional[Store] = None,
-        run_lock: Optional[asyncio.Lock] = None,   # <-- NEW
+        run_lock: Optional[asyncio.Lock] = None,
     ):
         self.email = email
         self.password = password
@@ -208,86 +179,36 @@ class DiscordScraper:
         self.data_dir = data_dir
         self.headless = headless
         self.store = store
-        self.run_lock = run_lock or asyncio.Lock()   # <-- NEW
+        self.run_lock = run_lock or asyncio.Lock()
 
         self.start_date: datetime | None = None
         if start_date:
             try:
                 self.start_date = datetime.fromisoformat(start_date).replace(tzinfo=timezone.utc)
-                log_safe(logger.info, f"Start date set: {self.start_date}")
+                logger.info(f"Start date set: {self.start_date}")
             except Exception as e:
-                log_safe(logger.warning, f"Invalid DISCORD_START_DATE: {start_date} – ignoring ({e})")
+                logger.warning(f"Invalid DISCORD_START_DATE: {start_date} – ignoring ({e})")
 
         self.context: BrowserContext | None = None
-        self._page: Page | None = None          # single shared page
+        self._page: Page | None = None
         self._running = False
         self._known_message_ids: dict[str, set[str]] = {}
         self._channel_guilds: dict[str, str] = {}
         self._last_poll: dict[str, float] = {}
         self._initial_load_done: dict[str, bool] = {}
 
-        # Per-channel forwarding counters
         self._ch_stats: dict[str, dict[str, int]] = {}
-
         self._download_stats = {"success": 0, "failed": 0, "total_bytes": 0}
         self.user_data_dir = data_dir / "chrome_user_data"
         self.user_data_dir.mkdir(exist_ok=True)
 
-    # ------------------------------------------------------------------ utils
-    def _normalize_url(self, url: str) -> str:
-        if not url:
-            return ""
-        url = url.split("#")[0]
-        url = url.replace("media.discordapp.net", "cdn.discordapp.com")
-        if url.startswith("//"):
-            url = "https:" + url
-        elif not url.startswith("http"):
-            url = "https://" + url
-        return url
+        # Internal flag to track if browser is launched
+        self._browser_ready = False
+        self._playwright = None
 
-    def _detect_attachment_type(self, url: str) -> str:
-        ext = Path(urlparse(url).path).suffix.lower()
-        if ext in self.IMAGE_EXTENSIONS:
-            return "image"
-        if ext in self.VIDEO_EXTENSIONS:
-            return "video"
-        if ext in self.DOCUMENT_EXTENSIONS:
-            return "document"
-        return "image"
-
-    def _validate_attachment_url(self, url: str) -> bool:
-        if not url:
-            return False
-        if "/stickers/" in url:
-            return False
-        return any(domain in url for domain in self.DISCORD_CDN_DOMAINS)
-
-    async def _human_delay(self, min_sec: float = 0.2, max_sec: float = 0.8):
-        await asyncio.sleep(random.uniform(min_sec, max_sec))
-
-    def _track(self, channel_id: str, key: str, delta: int = 1):
-        if channel_id not in self._ch_stats:
-            self._ch_stats[channel_id] = {
-                "collected": 0, "with_media": 0,
-                "forwarded": 0, "failed": 0,
-            }
-        self._ch_stats[channel_id][key] += delta
-
-    def _print_channel_summary(self, channel_id: str):
-        s = self._ch_stats.get(channel_id, {})
-        log_safe(logger.info,
-            f"[STATS] Channel {channel_id} summary: "
-            f"collected={s.get('collected', 0)} "
-            f"with_media={s.get('with_media', 0)} "
-            f"forwarded={s.get('forwarded', 0)} "
-            f"failed={s.get('failed', 0)}"
-        )
-
-    def reset_seen(self, channel_id: str):
-        self._known_message_ids[channel_id] = set()
-        self._initial_load_done[channel_id] = False
-
-    # --------------------------------------------------------- browser / login
+    # ------------------------------------------------------------------
+    # Browser lifecycle (deferred)
+    # ------------------------------------------------------------------
     def _get_browser_args(self) -> list[str]:
         return [
             "--disable-blink-features=AutomationControlled",
@@ -316,25 +237,17 @@ class DiscordScraper:
             timezone_id="America/New_York",
         )
 
-    async def _ensure_browser(self):
-        if self.context is None:
-            logger.info("Browser context is None – recreating")
-            p = await async_playwright().start()
-            self.context = await self._create_browser_context(p)
-            page = await self.context.new_page()
-            await page.goto(
-                "https://discord.com/channels/@me",
-                wait_until="networkidle", timeout=15000,
-            )
-            if not await self._is_logged_in(page):
-                await self._perform_login(page)
-            await page.close()
+    async def _ensure_browser_and_login(self):
+        """Launch browser and ensure login – called only when we hold the lock."""
+        if self._browser_ready and self.context is not None:
+            return
 
-    async def start(self):
-        self._running = True
-        p = await async_playwright().start()
-        self.context = await self._create_browser_context(p)
+        logger.info("Launching Discord browser...")
+        self._playwright = await async_playwright().start()
+        self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
+
+        # Navigate to test channel to check login
         test_channel = self.channels[0] if self.channels else None
         test_url = (
             f"https://discord.com/channels/{self.GUILD_ID}/{test_channel}"
@@ -342,24 +255,55 @@ class DiscordScraper:
         )
         await self._page.goto(test_url, wait_until="networkidle")
         await asyncio.sleep(2)
+
         if await self._is_logged_in(self._page):
-            log_safe(logger.info, "✓ Using existing Discord session")
+            logger.info("✓ Using existing Discord session")
+            self._browser_ready = True
             return
+
         logger.warning("Session invalid – re-logging in")
         await self._page.close()
         await self.context.close()
         shutil.rmtree(self.user_data_dir, ignore_errors=True)
         self.user_data_dir.mkdir(exist_ok=True)
-        self.context = await self._create_browser_context(p)
+
+        self.context = await self._create_browser_context(self._playwright)
         self._page = await self.context.new_page()
         await self._perform_login(self._page)
+
         if test_channel:
             await self._page.goto(test_url, wait_until="networkidle")
             await asyncio.sleep(2)
             if not await self._is_logged_in(self._page):
                 raise RuntimeError("Login seemed successful but cannot access channels")
-        log_safe(logger.info, "✓ Login confirmed – ready to poll")
 
+        logger.info("✓ Login confirmed – ready to poll")
+        self._browser_ready = True
+
+    async def _close_browser(self):
+        """Close the browser to free memory – called after releasing the lock."""
+        if self.context is not None:
+            try:
+                if self._page:
+                    await self._page.close()
+                await self.context.close()
+            except Exception as e:
+                logger.warning(f"Error closing browser: {e}")
+            self.context = None
+            self._page = None
+            self._browser_ready = False
+            if self._playwright:
+                try:
+                    await self._playwright.stop()
+                except Exception:
+                    pass
+                self._playwright = None
+            gc.collect()
+            logger.info("Discord browser closed")
+
+    # ------------------------------------------------------------------
+    # Login helpers (unchanged)
+    # ------------------------------------------------------------------
     async def _is_logged_in(self, page: Page) -> bool:
         try:
             url = page.url
@@ -392,13 +336,15 @@ class DiscordScraper:
         for _ in range(24):
             await asyncio.sleep(5)
             if await self._is_logged_in(page):
-                log_safe(logger.info, "✓ Login successful")
+                logger.info("✓ Login successful")
                 return
             if await page.locator('input[name="code"]').count() > 0:
-                log_safe(logger.warning, "⚠ 2FA required – enter code in browser")
+                logger.warning("⚠ 2FA required – enter code in browser")
         raise RuntimeError("Login failed after 2 minutes")
 
-    # ------------------------------------------------------- navigation
+    # ------------------------------------------------------------------
+    # Navigation (relies on self._page, which is set after browser launch)
+    # ------------------------------------------------------------------
     async def _page_alive(self, page: Page) -> bool:
         try:
             await page.evaluate("1")
@@ -408,7 +354,6 @@ class DiscordScraper:
 
     async def _navigate_to_channel(self, channel_id: str) -> Page:
         """Navigate the shared page to the given channel."""
-        await self._ensure_browser()
         if self._page is None or not await self._page_alive(self._page):
             logger.warning("Page is dead – recreating")
             self._page = await self.context.new_page()
@@ -437,7 +382,7 @@ class DiscordScraper:
         if m:
             self._channel_guilds[channel_id] = m.group(1)
 
-        log_safe(logger.info, f"✓ Navigated to channel {channel_id}")
+        logger.info(f"✓ Navigated to channel {channel_id}")
         return page
 
     async def _wait_for_chat(self, page: Page):
@@ -455,7 +400,6 @@ class DiscordScraper:
                 continue
         logger.warning("Chat container not found after navigation")
 
-    # ---------------------------------------------------- scroller helpers
     async def _dismiss_modals(self, page: Page):
         for btn in [
             'button:has-text("Accept")', 'button:has-text("Continue")',
@@ -470,6 +414,9 @@ class DiscordScraper:
             except Exception:
                 continue
 
+    # ------------------------------------------------------------------
+    # Message loading (unchanged)
+    # ------------------------------------------------------------------
     async def _find_scroller(self, page: Page):
         selectors = [
             'div[class*="scroller-"][class*="messages"]',
@@ -516,7 +463,6 @@ class DiscordScraper:
             pass
         return None
 
-    # --------------------------------------------------- message loading
     async def _load_messages(self, page: Page, max_scrolls: int = 10) -> list[dict]:
         if not await self._page_alive(page):
             logger.warning("Page is closed – skipping _load_messages")
@@ -524,9 +470,7 @@ class DiscordScraper:
 
         await self._dismiss_modals(page)
         scroller = await self._find_scroller(page)
-        if scroller:
-            logger.debug("Scroller found")
-        else:
+        if not scroller:
             logger.warning("Scroller not found – falling back to window scroll")
 
         seen_ids: set[str] = set()
@@ -604,9 +548,7 @@ class DiscordScraper:
                 })
 
             if i % 100 == 0 and i > 0:
-                log_safe(logger.info,
-                    f"Scroll {i}/{max_scrolls} | unique msgs so far: {len(seen_ids)}"
-                )
+                logger.info(f"Scroll {i}/{max_scrolls} | unique msgs: {len(seen_ids)}")
 
             if new_count == 0:
                 no_new_streak += 1
@@ -640,26 +582,18 @@ class DiscordScraper:
                     top_stuck_streak += 1
 
             if top_stuck_streak >= 5:
-                log_safe(logger.info, f"Reached top of channel after {i} scrolls")
+                logger.info(f"Reached top of channel after {i} scrolls")
                 break
             if no_new_streak >= 300:
-                log_safe(logger.info,
-                    f"No new messages after 300 scrolls ({i} total) – assuming top reached"
-                )
+                logger.info(f"No new messages after 300 scrolls ({i}) – assuming top reached")
                 break
 
-        log_safe(logger.info,
-            f"_load_messages done: {len(collected)} unique messages collected"
-        )
+        logger.info(f"_load_messages done: {len(collected)} unique messages")
         return collected
 
-    # ----------------------------------------------- checkpoint / new msgs
     async def _get_new_messages(self, channel_id: str, page: Page) -> list[dict]:
         initial_load = not self._initial_load_done.get(channel_id, False)
-
-        last_id: int = 0
-        if self.store is not None:
-            last_id = self.store.get_last_processed(channel_id) or 0
+        last_id = self.store.get_last_processed(channel_id) or 0 if self.store else 0
 
         max_scrolls = 500 if initial_load else 15
         all_msgs = await self._load_messages(page, max_scrolls=max_scrolls)
@@ -675,7 +609,7 @@ class DiscordScraper:
                 msg_id_int = int(msg["id"])
             except ValueError:
                 msg_id_int = 0
-            if msg_id_int <= last_id:
+            if msg_id_int <= int(last_id):
                 continue
             new_msgs.append(msg)
 
@@ -689,13 +623,12 @@ class DiscordScraper:
         for msg in new_msgs:
             self._known_message_ids[channel_id].add(msg["id"])
 
-        log_safe(logger.info,
-            f"Channel {channel_id}: {len(new_msgs)} new messages "
-            f"(last_id={last_id})"
-        )
+        logger.info(f"Channel {channel_id}: {len(new_msgs)} new messages (last_id={last_id})")
         return new_msgs
 
-    # ---------------------------------------------------- download
+    # ------------------------------------------------------------------
+    # Download (uses self.context – available after browser launch)
+    # ------------------------------------------------------------------
     async def _download_attachment(
         self, url: str, dest: Path, retries: int = 5
     ) -> Path | None:
@@ -707,34 +640,22 @@ class DiscordScraper:
                 response = await self.context.request.get(url, timeout=60_000)
                 if response.status == 200:
                     body = await response.body()
-                    if len(body) == 0:
-                        logger.warning(f"Empty body for {url}")
-                        return None
-                    dest.write_bytes(body)
-                    self._download_stats["success"] += 1
-                    self._download_stats["total_bytes"] += len(body)
-                    log_safe(logger.info,
-                        f"[OK] Downloaded {dest.name} "
-                        f"({len(body)/1024/1024:.2f} MB)"
-                    )
-                    return dest
+                    if body:
+                        dest.write_bytes(body)
+                        self._download_stats["success"] += 1
+                        self._download_stats["total_bytes"] += len(body)
+                        logger.info(f"[OK] Downloaded {dest.name} ({len(body)/1024/1024:.2f} MB)")
+                        return dest
                 elif response.status in (403, 404, 410):
-                    logger.error(
-                        f"Permanent HTTP {response.status} for {url} – giving up"
-                    )
+                    logger.error(f"Permanent HTTP {response.status} for {url}")
                     self._download_stats["failed"] += 1
                     return None
                 else:
-                    logger.warning(
-                        f"HTTP {response.status} for {url} "
-                        f"(attempt {attempt}/{retries})"
-                    )
+                    logger.warning(f"HTTP {response.status} attempt {attempt}")
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout downloading {url} (attempt {attempt}/{retries})")
+                logger.warning(f"Timeout downloading {url} (attempt {attempt})")
             except Exception as e:
-                logger.warning(
-                    f"Download error (attempt {attempt}/{retries}): {e}"
-                )
+                logger.warning(f"Download error (attempt {attempt}): {e}")
 
             if attempt < retries:
                 wait = min(2 ** attempt, 30)
@@ -742,10 +663,48 @@ class DiscordScraper:
                 await asyncio.sleep(wait)
 
         self._download_stats["failed"] += 1
-        log_safe(logger.error, f"[FAIL] Could not download after {retries} attempts: {url}")
+        logger.error(f"[FAIL] Could not download after {retries} attempts: {url}")
         return None
 
-    # ------------------------------------------------- process & forward
+    # ------------------------------------------------------------------
+    # Helper: normalize URL (unchanged)
+    # ------------------------------------------------------------------
+    def _normalize_url(self, url: str) -> str:
+        if not url:
+            return ""
+        url = url.split("#")[0]
+        url = url.replace("media.discordapp.net", "cdn.discordapp.com")
+        if url.startswith("//"):
+            url = "https:" + url
+        elif not url.startswith("http"):
+            url = "https://" + url
+        return url
+
+    def _validate_attachment_url(self, url: str) -> bool:
+        if not url:
+            return False
+        if "/stickers/" in url:
+            return False
+        return any(domain in url for domain in self.DISCORD_CDN_DOMAINS)
+
+    def _track(self, channel_id: str, key: str, delta: int = 1):
+        if channel_id not in self._ch_stats:
+            self._ch_stats[channel_id] = {"collected": 0, "with_media": 0, "forwarded": 0, "failed": 0}
+        self._ch_stats[channel_id][key] += delta
+
+    def _print_channel_summary(self, channel_id: str):
+        s = self._ch_stats.get(channel_id, {})
+        logger.info(f"[STATS] Channel {channel_id}: collected={s.get('collected',0)} "
+                    f"with_media={s.get('with_media',0)} forwarded={s.get('forwarded',0)} "
+                    f"failed={s.get('failed',0)}")
+
+    def reset_seen(self, channel_id: str):
+        self._known_message_ids[channel_id] = set()
+        self._initial_load_done[channel_id] = False
+
+    # ------------------------------------------------------------------
+    # Process message (unchanged)
+    # ------------------------------------------------------------------
     async def _process_message(self, msg: dict, source_info: SourceInfo):
         class _MsgWrapper:
             def __init__(self, d):
@@ -770,160 +729,99 @@ class DiscordScraper:
                     self._track(channel_id, "forwarded")
                     ok = self._ch_stats[channel_id]["forwarded"]
                     if ok % 50 == 0:
-                        log_safe(logger.info,
-                            f"[STATS] {channel_id}: {ok} media messages forwarded so far"
-                        )
+                        logger.info(f"[STATS] {channel_id}: {ok} media messages forwarded so far")
                 else:
                     self._track(channel_id, "failed")
         except Exception as e:
-            logger.error(
-                f"Error in message callback for {msg['id']}: {e}", exc_info=True
-            )
+            logger.error(f"Error in message callback for {msg['id']}: {e}", exc_info=True)
             if has_media:
                 self._track(channel_id, "failed")
 
-    # -------------------------------------------------------- poll loop (with locking)
+    # ------------------------------------------------------------------
+    # Public methods: start, poll_channels, stop
+    # ------------------------------------------------------------------
+    async def start(self):
+        """Initialize scraper – does NOT launch browser."""
+        self._running = True
+        logger.info("Discord scraper initialized (browser will launch on first poll)")
+
     async def poll_channels(self):
+        """Main polling loop – acquires lock, launches browser, processes, then closes browser."""
         if not self._running:
             raise RuntimeError("Scraper not started – call start() first")
 
-        log_safe(logger.info,
-            f"[POLL] Starting poll loop for {len(self.channels)} channels"
-        )
+        logger.info(f"[POLL] Starting poll loop for {len(self.channels)} channels")
         poll_count = 0
 
         while self._running:
-            # Acquire the shared lock – only one scraper can run at a time
+            # Acquire lock – only one scraper at a time
             async with self.run_lock:
                 poll_count += 1
                 logger.info(f"=== Discord Poll cycle #{poll_count} ===")
 
-                # Process each channel sequentially
-                for channel_id in self.channels:
-                    # Rate limit per channel
-                    now = time.time()
-                    if now - self._last_poll.get(channel_id, 0) < 10:
-                        continue
-                    self._last_poll[channel_id] = now
+                try:
+                    # Ensure browser is launched and logged in
+                    await self._ensure_browser_and_login()
 
-                    try:
-                        # Navigate to the channel (reuses the shared page)
-                        page = await self._navigate_to_channel(channel_id)
-                        if not await self._page_alive(page):
-                            logger.warning(f"Page not alive for channel {channel_id} – skipping")
-                            # Recreate page
-                            self._page = await self.context.new_page()
+                    # Process each channel
+                    for channel_id in self.channels:
+                        now = time.time()
+                        if now - self._last_poll.get(channel_id, 0) < 10:
                             continue
+                        self._last_poll[channel_id] = now
 
-                        # Scroll to bottom to load latest
                         try:
-                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            page = await self._navigate_to_channel(channel_id)
+                            if not await self._page_alive(page):
+                                logger.warning(f"Page not alive for {channel_id} – skipping")
+                                self._page = await self.context.new_page()
+                                continue
+
+                            # Scroll to bottom
+                            try:
+                                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                            except Exception:
+                                pass
+                            await asyncio.sleep(random.uniform(0.5, 1.5))
+
+                            messages = await self._get_new_messages(channel_id, page)
+                            if messages:
+                                logger.info(f"[MSG] Processing {len(messages)} new messages from {channel_id}")
+                                for msg in messages:
+                                    info = SourceInfo(
+                                        platform="discord",
+                                        channel_id=channel_id,
+                                        channel_name=f"Channel-{channel_id}",
+                                        author="Discord Scraper",
+                                    )
+                                    await self._process_message(msg, info)
+                                self._print_channel_summary(channel_id)
+                            else:
+                                logger.debug(f"No new messages in {channel_id}")
+
                         except Exception:
-                            pass
-                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                            logger.exception(f"Error polling channel {channel_id}")
+                            try:
+                                await self._page.close()
+                            except Exception:
+                                pass
+                            self._page = await self.context.new_page()
+                            await asyncio.sleep(5)
 
-                        messages = await self._get_new_messages(channel_id, page)
-                        if messages:
-                            log_safe(logger.info,
-                                f"[MSG] Processing {len(messages)} new messages "
-                                f"from {channel_id}"
-                            )
-                            for msg in messages:
-                                info = SourceInfo(
-                                    platform="discord",
-                                    channel_id=channel_id,
-                                    channel_name=f"Channel-{channel_id}",
-                                    author="Discord Scraper",
-                                )
-                                await self._process_message(msg, info)
+                        await asyncio.sleep(random.uniform(1, 3))
 
-                            self._print_channel_summary(channel_id)
-                        else:
-                            logger.debug(f"No new messages in {channel_id}")
+                except Exception as e:
+                    logger.exception(f"Error in poll cycle: {e}")
 
-                    except Exception:
-                        logger.exception(f"Error polling channel {channel_id}")
-                        # If page is broken, recreate it
-                        try:
-                            await self._page.close()
-                        except Exception:
-                            pass
-                        self._page = await self.context.new_page()
-                        await asyncio.sleep(5)
-
-                    # Small delay between channels
-                    await asyncio.sleep(random.uniform(1, 3))
-
-                # After processing all channels, optionally restart the page
-                if poll_count % 5 == 0 and self._page:
-                    try:
-                        await self._page.close()
-                    except Exception:
-                        pass
-                    self._page = await self.context.new_page()
-                    gc.collect()
-                    log_safe(logger.info, "Page restarted to free memory")
-
-                # Global download stats every 10 cycles
-                if poll_count % 10 == 0:
-                    log_safe(logger.info,
-                        f"[STATS] Downloads: "
-                        f"{self._download_stats['success']} ok / "
-                        f"{self._download_stats['failed']} failed / "
-                        f"{self._download_stats['total_bytes']/1024/1024:.1f} MB"
-                    )
+                finally:
+                    # Close browser to free memory – critical!
+                    await self._close_browser()
 
             # Sleep outside the lock so other scrapers can run
             await asyncio.sleep(random.uniform(15, 30))
 
-    # -------------------------------------------------------- backfill
-    async def backfill(self, channel_id: str, limit: int):
-        log_safe(logger.info, f"[BACKFILL] Starting for {channel_id} (limit={limit})")
-        page = await self._navigate_to_channel(channel_id)
-        self.reset_seen(channel_id)
-        total = 0
-
-        while total < limit:
-            msgs = await self._load_messages(page, max_scrolls=50)
-            if channel_id not in self._known_message_ids:
-                self._known_message_ids[channel_id] = set()
-
-            new = []
-            for m in msgs:
-                if m["id"] not in self._known_message_ids[channel_id]:
-                    self._known_message_ids[channel_id].add(m["id"])
-                    new.append(m)
-
-            if not new:
-                break
-            total += len(new)
-            logger.info(f"Backfill progress: {total}/{limit}")
-
-            for m in new:
-                info = SourceInfo(
-                    platform="discord",
-                    channel_id=channel_id,
-                    channel_name=f"Channel-{channel_id}",
-                    author="Discord Backfill",
-                )
-                await self._process_message(m, info)
-
-            if total >= limit:
-                break
-            await asyncio.sleep(2)
-
-        log_safe(logger.info, f"[OK] Backfill done: {total} messages processed")
-
-    # ----------------------------------------------------------- stop
     async def stop(self):
-        log_safe(logger.info, "[STOP] Stopping scraper …")
+        logger.info("[STOP] Stopping scraper …")
         self._running = False
-        if self._page:
-            try:
-                await self._page.close()
-            except Exception:
-                pass
-            self._page = None
-        if self.context:
-            await self.context.close()
-        log_safe(logger.info, "[OK] Scraper stopped")
+        await self._close_browser()
+        logger.info("[OK] Scraper stopped")
