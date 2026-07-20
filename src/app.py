@@ -19,6 +19,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import MessageMediaUnsupported
 from telethon.utils import get_peer_id
+from telethon.sessions import StringSession   # <-- NEW: for session string support
 
 from .config import Settings, load_settings
 from .db import Store
@@ -70,11 +71,24 @@ class MediaForwarder:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.store = Store(settings.data_dir / "forwarder.db")
-        self.telegram = TelegramClient(
-            settings.telegram_session,
-            settings.telegram_api_id,
-            settings.telegram_api_hash,
-        )
+
+        # ---- Telegram client with session string support ----
+        session_string = os.environ.get("TELEGRAM_SESSION_STRING")
+        if session_string:
+            self.telegram = TelegramClient(
+                StringSession(session_string),
+                settings.telegram_api_id,
+                settings.telegram_api_hash,
+            )
+            logger.info("Using TELEGRAM_SESSION_STRING for authentication.")
+        else:
+            self.telegram = TelegramClient(
+                settings.telegram_session,
+                settings.telegram_api_id,
+                settings.telegram_api_hash,
+            )
+            logger.info("Using file-based session: %s", settings.telegram_session)
+
         self.formatter = MessageFormatter(
             settings.include_source,
             settings.include_author,
