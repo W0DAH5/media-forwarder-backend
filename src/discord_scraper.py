@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import random
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Coroutine, Optional
 from urllib.parse import urlparse, unquote
 
+import psutil
 from playwright.async_api import async_playwright, BrowserContext, Page
 
 from .models import SourceInfo
@@ -65,11 +67,8 @@ _EXTRACT_JS = r"""
 
     function isMediaUrl(url) {
         if (!url) return false;
-        // Must be an absolute URL or protocol-relative
         if (!url.startsWith('http') && !url.startsWith('//')) return false;
-        // Sticker URLs (excluded per user request)
         if (url.includes('/stickers/')) return false;
-        // Must be from a Discord CDN OR contain /attachments/
         const fromCdn = CDN_HOSTS.some(h => url.includes(h));
         const isAttachment = url.includes('/attachments/');
         return fromCdn || isAttachment;
@@ -77,22 +76,16 @@ _EXTRACT_JS = r"""
 
     function cleanUrl(url) {
         if (!url) return null;
-        // Strip query params that cause 403s after URL expiry, keep base
-        // Actually keep the full URL including ex= token for downloads
         if (url.startsWith('//')) url = 'https:' + url;
-        return url.split('#')[0]; // strip fragment only
+        return url.split('#')[0];
     }
 
     function extractFromElement(el) {
         const urls = new Set();
-
-        // 1. Direct <a> links to attachments
         el.querySelectorAll('a[href]').forEach(a => {
             const href = a.getAttribute('href');
             if (href && isMediaUrl(href)) urls.add(cleanUrl(href));
         });
-
-        // 2. <img> tags – multiple src attributes Discord uses
         el.querySelectorAll('img').forEach(img => {
             for (const attr of ['src', 'data-safe-src', 'data-original-src',
                                 'data-src', 'data-url']) {
@@ -100,16 +93,12 @@ _EXTRACT_JS = r"""
                 if (v && isMediaUrl(v)) { urls.add(cleanUrl(v)); break; }
             }
         });
-
-        // 3. <video> and <source> tags
         el.querySelectorAll('video, video source').forEach(v => {
             for (const attr of ['src', 'data-src', 'data-url']) {
                 const s = v.getAttribute(attr);
                 if (s && isMediaUrl(s)) { urls.add(cleanUrl(s)); break; }
             }
         });
-
-        // 4. Wrapper divs with data attributes Discord uses for lazy loading
         el.querySelectorAll('[data-attachment-url], [data-media-url], ' +
                             '[data-original-filename]').forEach(d => {
             for (const attr of ['data-attachment-url', 'data-media-url',
@@ -118,8 +107,6 @@ _EXTRACT_JS = r"""
                 if (v && isMediaUrl(v)) { urls.add(cleanUrl(v)); break; }
             }
         });
-
-        // 5. Background images in style attributes (sometimes used for embeds)
         el.querySelectorAll('[style*="discordapp"]').forEach(d => {
             const style = d.getAttribute('style') || '';
             const matches = style.match(/url\(['"]?([^'")\s]+)['"]?\)/g) || [];
@@ -128,14 +115,11 @@ _EXTRACT_JS = r"""
                 if (isMediaUrl(inner)) urls.add(cleanUrl(inner));
             });
         });
-
-        // 6. Anchor wrappers around images (Discord wraps images in <a>)
         el.querySelectorAll('a[class*="originalLink"], a[class*="imageWrapper"],' +
                             'a[class*="anchor"]').forEach(a => {
             const href = a.getAttribute('href');
             if (href && isMediaUrl(href)) urls.add(cleanUrl(href));
         });
-
         return [...urls].filter(Boolean);
     }
 
@@ -143,7 +127,6 @@ _EXTRACT_JS = r"""
     const seenIds = new Set();
 
     document.querySelectorAll('[data-list-item-id]').forEach(el => {
-        // Extract numeric message ID
         let rawId = el.getAttribute('data-list-item-id') || '';
         let msgId = rawId;
         if (msgId.includes('___')) {
@@ -156,14 +139,12 @@ _EXTRACT_JS = r"""
         if (!msgId || seenIds.has(msgId)) return;
         seenIds.add(msgId);
 
-        // Timestamp
         let ts = el.getAttribute('data-timestamp') || '';
         if (!ts) {
             const timeEl = el.querySelector('time[datetime]');
             if (timeEl) ts = timeEl.getAttribute('datetime') || '';
         }
 
-        // Text content
         let text = '';
         const textEl = el.querySelector(
             'div[class*="messageContent"], div[id^="message-content"],' +
@@ -171,10 +152,8 @@ _EXTRACT_JS = r"""
         );
         if (textEl) text = (textEl.innerText || '').slice(0, 2000);
 
-        // All media URLs
         const attachments = extractFromElement(el);
 
-        // Also check embed containers
         el.querySelectorAll(
             'div[class*="embed"], div[class*="attachment"],' +
             'div[class*="imageContainer"], div[class*="videoWrapper"],' +
@@ -219,6 +198,7 @@ class DiscordScraper:
         headless: bool = False,
         start_date: str | None = None,
         store: Optional[Store] = None,
+        run_lock: Optional[asyncio.Lock] = None,   # <-- NEW
     ):
         self.email = email
         self.password = password
@@ -228,6 +208,7 @@ class DiscordScraper:
         self.data_dir = data_dir
         self.headless = headless
         self.store = store
+        self.run_lock = run_lock or asyncio.Lock()   # <-- NEW
 
         self.start_date: datetime | None = None
         if start_date:
@@ -238,14 +219,14 @@ class DiscordScraper:
                 log_safe(logger.warning, f"Invalid DISCORD_START_DATE: {start_date} – ignoring ({e})")
 
         self.context: BrowserContext | None = None
+        self._page: Page | None = None          # single shared page
         self._running = False
         self._known_message_ids: dict[str, set[str]] = {}
-        self._channel_pages: dict[str, Page] = {}
         self._channel_guilds: dict[str, str] = {}
         self._last_poll: dict[str, float] = {}
         self._initial_load_done: dict[str, bool] = {}
 
-        # Per-channel forwarding counters for summary reporting
+        # Per-channel forwarding counters
         self._ch_stats: dict[str, dict[str, int]] = {}
 
         self._download_stats = {"success": 0, "failed": 0, "total_bytes": 0}
@@ -272,13 +253,13 @@ class DiscordScraper:
             return "video"
         if ext in self.DOCUMENT_EXTENSIONS:
             return "document"
-        return "image"  # default for unknown CDN media
+        return "image"
 
     def _validate_attachment_url(self, url: str) -> bool:
         if not url:
             return False
         if "/stickers/" in url:
-            return False  # skip stickers per user request
+            return False
         return any(domain in url for domain in self.DISCORD_CDN_DOMAINS)
 
     async def _human_delay(self, min_sec: float = 0.2, max_sec: float = 0.8):
@@ -353,33 +334,31 @@ class DiscordScraper:
         self._running = True
         p = await async_playwright().start()
         self.context = await self._create_browser_context(p)
-        page = await self.context.new_page()
+        self._page = await self.context.new_page()
         test_channel = self.channels[0] if self.channels else None
         test_url = (
             f"https://discord.com/channels/{self.GUILD_ID}/{test_channel}"
             if test_channel else "https://discord.com/channels/@me"
         )
-        await page.goto(test_url, wait_until="networkidle")
+        await self._page.goto(test_url, wait_until="networkidle")
         await asyncio.sleep(2)
-        if await self._is_logged_in(page):
+        if await self._is_logged_in(self._page):
             log_safe(logger.info, "✓ Using existing Discord session")
-            await page.close()
             return
         logger.warning("Session invalid – re-logging in")
-        await page.close()
+        await self._page.close()
         await self.context.close()
         shutil.rmtree(self.user_data_dir, ignore_errors=True)
         self.user_data_dir.mkdir(exist_ok=True)
         self.context = await self._create_browser_context(p)
-        page = await self.context.new_page()
-        await self._perform_login(page)
+        self._page = await self.context.new_page()
+        await self._perform_login(self._page)
         if test_channel:
-            await page.goto(test_url, wait_until="networkidle")
+            await self._page.goto(test_url, wait_until="networkidle")
             await asyncio.sleep(2)
-            if not await self._is_logged_in(page):
+            if not await self._is_logged_in(self._page):
                 raise RuntimeError("Login seemed successful but cannot access channels")
         log_safe(logger.info, "✓ Login confirmed – ready to poll")
-        await page.close()
 
     async def _is_logged_in(self, page: Page) -> bool:
         try:
@@ -428,54 +407,36 @@ class DiscordScraper:
             return False
 
     async def _navigate_to_channel(self, channel_id: str) -> Page:
+        """Navigate the shared page to the given channel."""
         await self._ensure_browser()
+        if self._page is None or not await self._page_alive(self._page):
+            logger.warning("Page is dead – recreating")
+            self._page = await self.context.new_page()
 
-        # Reuse existing page if valid
-        if channel_id in self._channel_pages:
-            page = self._channel_pages[channel_id]
-            if await self._page_alive(page):
-                url = page.url
-                if "/login" in url or "/download" in url:
-                    logger.warning("Session expired – re-logging in")
-                    await self._perform_login(page)
-                    guild = self._channel_guilds.get(channel_id, self.GUILD_ID)
-                    await page.goto(
-                        f"https://discord.com/channels/{guild}/{channel_id}",
-                        wait_until="networkidle", timeout=30000,
-                    )
-                    await self._wait_for_chat(page)
-                elif channel_id not in url:
-                    guild = self._channel_guilds.get(channel_id, self.GUILD_ID)
-                    await page.goto(
-                        f"https://discord.com/channels/{guild}/{channel_id}",
-                        wait_until="networkidle", timeout=30000,
-                    )
-                    await self._wait_for_chat(page)
-                return page
-            else:
-                logger.warning(f"Page for {channel_id} died – recreating")
-                del self._channel_pages[channel_id]
+        page = self._page
+        url = page.url
+        if channel_id in url:
+            return page
 
-        logger.info(f"Creating new page for channel {channel_id}")
-        page = await self.context.new_page()
-        page.on('dialog', lambda d: asyncio.ensure_future(d.accept()))
+        if "/login" in url or "/download" in url:
+            logger.warning("Session expired – re-logging in")
+            await self._perform_login(page)
+
         guild = self._channel_guilds.get(channel_id, self.GUILD_ID)
         target = f"https://discord.com/channels/{guild}/{channel_id}"
         await page.goto(target, wait_until="networkidle", timeout=30000)
 
         if "/login" in page.url or "/download" in page.url:
-            logger.warning("Session expired – re-logging in")
+            logger.warning("Session expired during navigation – re-logging in")
             await self._perform_login(page)
             await page.goto(target, wait_until="networkidle", timeout=30000)
 
         await self._wait_for_chat(page)
 
-        # Detect guild ID from URL
         m = re.search(r"/channels/(\d+)/(\d+)", page.url)
         if m:
             self._channel_guilds[channel_id] = m.group(1)
 
-        self._channel_pages[channel_id] = page
         log_safe(logger.info, f"✓ Navigated to channel {channel_id}")
         return page
 
@@ -510,10 +471,6 @@ class DiscordScraper:
                 continue
 
     async def _find_scroller(self, page: Page):
-        """
-        Return the scrollable message list element.
-        Tries multiple selectors, then falls back to scanning all divs.
-        """
         selectors = [
             'div[class*="scroller-"][class*="messages"]',
             'div[class*="scroller-"][role="list"]',
@@ -535,7 +492,6 @@ class DiscordScraper:
             except Exception:
                 continue
 
-        # Generic fallback: largest scrollable div
         el = await page.evaluate_handle("""
             () => {
                 let best = null, bestH = 0;
@@ -562,10 +518,6 @@ class DiscordScraper:
 
     # --------------------------------------------------- message loading
     async def _load_messages(self, page: Page, max_scrolls: int = 10) -> list[dict]:
-        """
-        Scroll to the very top of the channel and collect every message.
-        Returns a list of message dicts with id, timestamp, text, attachments.
-        """
         if not await self._page_alive(page):
             logger.warning("Page is closed – skipping _load_messages")
             return []
@@ -573,7 +525,7 @@ class DiscordScraper:
         await self._dismiss_modals(page)
         scroller = await self._find_scroller(page)
         if scroller:
-            logger.info("Scroller found")
+            logger.debug("Scroller found")
         else:
             logger.warning("Scroller not found – falling back to window scroll")
 
@@ -585,7 +537,6 @@ class DiscordScraper:
         prev_top: float = -1
 
         for i in range(max_scrolls):
-            # ---- scroll up ----
             try:
                 if scroller:
                     top_before = await scroller.evaluate("e => e.scrollTop")
@@ -598,7 +549,6 @@ class DiscordScraper:
                 scroller = None
                 continue
 
-            # Wait for Discord to render newly loaded messages
             await asyncio.sleep(0.8)
             try:
                 await page.wait_for_load_state("networkidle", timeout=2000)
@@ -606,7 +556,6 @@ class DiscordScraper:
                 pass
             await asyncio.sleep(0.3)
 
-            # Click any "Load More" / "Jump to beginning" buttons
             for btn_text in ["Load More", "Jump to Beginning", "Oldest"]:
                 try:
                     btn = page.locator(f'button:has-text("{btn_text}")')
@@ -616,7 +565,6 @@ class DiscordScraper:
                 except Exception:
                     pass
 
-            # ---- extract all visible messages ----
             try:
                 message_data: list[dict] = await page.evaluate(_EXTRACT_JS)
             except Exception as e:
@@ -631,7 +579,6 @@ class DiscordScraper:
                 seen_ids.add(msg_id)
                 new_count += 1
 
-                # Normalise timestamp
                 ts = data.get("timestamp", "")
                 try:
                     if ts:
@@ -642,7 +589,6 @@ class DiscordScraper:
                 except Exception:
                     parsed_ts = datetime.now(timezone.utc).isoformat()
 
-                # Normalise attachment URLs
                 raw_urls: list[str] = data.get("attachments", [])
                 clean_urls = []
                 for u in raw_urls:
@@ -657,19 +603,16 @@ class DiscordScraper:
                     "attachments": clean_urls,
                 })
 
-            # ---- progress log every 100 scrolls ----
             if i % 100 == 0 and i > 0:
                 log_safe(logger.info,
                     f"Scroll {i}/{max_scrolls} | unique msgs so far: {len(seen_ids)}"
                 )
 
-            # ---- check for streak of no new messages ----
             if new_count == 0:
                 no_new_streak += 1
             else:
                 no_new_streak = 0
 
-            # ---- check if we are stuck at the top ----
             try:
                 if scroller:
                     cur_top = await scroller.evaluate("e => e.scrollTop")
@@ -685,7 +628,6 @@ class DiscordScraper:
             prev_top = cur_top
 
             if cur_top == 0:
-                # Might genuinely be at top; wait a beat and confirm
                 await asyncio.sleep(1.0)
                 try:
                     confirm_top = (
@@ -697,7 +639,6 @@ class DiscordScraper:
                 if confirm_top == 0:
                     top_stuck_streak += 1
 
-            # Terminal conditions
             if top_stuck_streak >= 5:
                 log_safe(logger.info, f"Reached top of channel after {i} scrolls")
                 break
@@ -720,7 +661,7 @@ class DiscordScraper:
         if self.store is not None:
             last_id = self.store.get_last_processed(channel_id) or 0
 
-        max_scrolls = 5000 if initial_load else 15
+        max_scrolls = 500 if initial_load else 15
         all_msgs = await self._load_messages(page, max_scrolls=max_scrolls)
 
         if not all_msgs:
@@ -738,13 +679,11 @@ class DiscordScraper:
                 continue
             new_msgs.append(msg)
 
-        # Oldest first
         new_msgs.sort(key=lambda m: int(m["id"]) if m["id"].isdigit() else 0)
 
         if initial_load:
             self._initial_load_done[channel_id] = True
 
-        # Update in-memory set
         if channel_id not in self._known_message_ids:
             self._known_message_ids[channel_id] = set()
         for msg in new_msgs:
@@ -760,10 +699,6 @@ class DiscordScraper:
     async def _download_attachment(
         self, url: str, dest: Path, retries: int = 5
     ) -> Path | None:
-        """
-        Download a single attachment with exponential back-off retry.
-        Returns the Path on success, None on permanent failure.
-        """
         url = self._normalize_url(url)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
@@ -847,7 +782,7 @@ class DiscordScraper:
             if has_media:
                 self._track(channel_id, "failed")
 
-    # -------------------------------------------------------- poll loop
+    # -------------------------------------------------------- poll loop (with locking)
     async def poll_channels(self):
         if not self._running:
             raise RuntimeError("Scraper not started – call start() first")
@@ -858,69 +793,88 @@ class DiscordScraper:
         poll_count = 0
 
         while self._running:
-            poll_count += 1
-            logger.info(f"=== Poll cycle #{poll_count} ===")
+            # Acquire the shared lock – only one scraper can run at a time
+            async with self.run_lock:
+                poll_count += 1
+                logger.info(f"=== Discord Poll cycle #{poll_count} ===")
 
-            for channel_id in self.channels:
-                try:
+                # Process each channel sequentially
+                for channel_id in self.channels:
+                    # Rate limit per channel
                     now = time.time()
                     if now - self._last_poll.get(channel_id, 0) < 10:
                         continue
                     self._last_poll[channel_id] = now
 
-                    page = await self._navigate_to_channel(channel_id)
-                    if not await self._page_alive(page):
-                        logger.warning(f"Page {channel_id} not alive – skipping")
-                        self._channel_pages.pop(channel_id, None)
-                        continue
-
-                    # Scroll to bottom first so Discord loads the channel
                     try:
-                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    except Exception:
-                        pass
-                    await asyncio.sleep(random.uniform(0.5, 1.5))
+                        # Navigate to the channel (reuses the shared page)
+                        page = await self._navigate_to_channel(channel_id)
+                        if not await self._page_alive(page):
+                            logger.warning(f"Page not alive for channel {channel_id} – skipping")
+                            # Recreate page
+                            self._page = await self.context.new_page()
+                            continue
 
-                    messages = await self._get_new_messages(channel_id, page)
-                    if messages:
-                        log_safe(logger.info,
-                            f"[MSG] Processing {len(messages)} new messages "
-                            f"from {channel_id}"
-                        )
-                        for msg in messages:
-                            info = SourceInfo(
-                                platform="discord",
-                                channel_id=channel_id,
-                                channel_name=f"Channel-{channel_id}",
-                                author="Discord Scraper",
-                            )
-                            await self._process_message(msg, info)
-
-                        # Print per-channel summary after processing
-                        self._print_channel_summary(channel_id)
-                    else:
-                        logger.debug(f"No new messages in {channel_id}")
-
-                except Exception:
-                    logger.exception(f"Error polling channel {channel_id}")
-                    page = self._channel_pages.pop(channel_id, None)
-                    if page:
+                        # Scroll to bottom to load latest
                         try:
-                            await page.close()
+                            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                         except Exception:
                             pass
-                    await asyncio.sleep(5)
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
 
-            # Global download stats every 10 cycles
-            if poll_count % 10 == 0:
-                log_safe(logger.info,
-                    f"[STATS] Downloads: "
-                    f"{self._download_stats['success']} ok / "
-                    f"{self._download_stats['failed']} failed / "
-                    f"{self._download_stats['total_bytes']/1024/1024:.1f} MB"
-                )
+                        messages = await self._get_new_messages(channel_id, page)
+                        if messages:
+                            log_safe(logger.info,
+                                f"[MSG] Processing {len(messages)} new messages "
+                                f"from {channel_id}"
+                            )
+                            for msg in messages:
+                                info = SourceInfo(
+                                    platform="discord",
+                                    channel_id=channel_id,
+                                    channel_name=f"Channel-{channel_id}",
+                                    author="Discord Scraper",
+                                )
+                                await self._process_message(msg, info)
 
-            await asyncio.sleep(random.uniform(10, 20))
+                            self._print_channel_summary(channel_id)
+                        else:
+                            logger.debug(f"No new messages in {channel_id}")
+
+                    except Exception:
+                        logger.exception(f"Error polling channel {channel_id}")
+                        # If page is broken, recreate it
+                        try:
+                            await self._page.close()
+                        except Exception:
+                            pass
+                        self._page = await self.context.new_page()
+                        await asyncio.sleep(5)
+
+                    # Small delay between channels
+                    await asyncio.sleep(random.uniform(1, 3))
+
+                # After processing all channels, optionally restart the page
+                if poll_count % 5 == 0 and self._page:
+                    try:
+                        await self._page.close()
+                    except Exception:
+                        pass
+                    self._page = await self.context.new_page()
+                    gc.collect()
+                    log_safe(logger.info, "Page restarted to free memory")
+
+                # Global download stats every 10 cycles
+                if poll_count % 10 == 0:
+                    log_safe(logger.info,
+                        f"[STATS] Downloads: "
+                        f"{self._download_stats['success']} ok / "
+                        f"{self._download_stats['failed']} failed / "
+                        f"{self._download_stats['total_bytes']/1024/1024:.1f} MB"
+                    )
+
+            # Sleep outside the lock so other scrapers can run
+            await asyncio.sleep(random.uniform(15, 30))
 
     # -------------------------------------------------------- backfill
     async def backfill(self, channel_id: str, limit: int):
@@ -964,12 +918,12 @@ class DiscordScraper:
     async def stop(self):
         log_safe(logger.info, "[STOP] Stopping scraper …")
         self._running = False
-        for page in list(self._channel_pages.values()):
+        if self._page:
             try:
-                await page.close()
+                await self._page.close()
             except Exception:
                 pass
-        self._channel_pages.clear()
+            self._page = None
         if self.context:
             await self.context.close()
         log_safe(logger.info, "[OK] Scraper stopped")

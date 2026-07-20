@@ -19,7 +19,7 @@ from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError, RPCError
 from telethon.tl.types import MessageMediaUnsupported
 from telethon.utils import get_peer_id
-from telethon.sessions import StringSession   # <-- NEW: for session string support
+from telethon.sessions import StringSession
 
 from .config import Settings, load_settings
 from .db import Store
@@ -104,6 +104,9 @@ class MediaForwarder:
             settings.watermark_text,
         )
 
+        # ---- Shared lock for scrapers (prevents simultaneous runs) ----
+        self._scraper_lock = asyncio.Lock()
+
         # ---- Discord bot (optional) ----
         self.discord = None
         if settings.discord_token:
@@ -133,6 +136,7 @@ class MediaForwarder:
                 headless=not settings.discord_show_browser,
                 start_date=settings.discord_start_date,
                 store=self.store,
+                run_lock=self._scraper_lock,   # <-- pass shared lock
             )
             for ch in channels:
                 if not self.store.get_source(ch):
@@ -152,6 +156,7 @@ class MediaForwarder:
                 store=self.store,
                 headless=not settings.telegram_show_browser,
                 poll_interval=settings.telegram_scraper_poll_interval,
+                run_lock=self._scraper_lock,   # <-- pass shared lock
             )
             logger.info("Telegram scraper initialized.")
 

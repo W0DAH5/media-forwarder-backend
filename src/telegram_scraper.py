@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import random
 import re
@@ -104,6 +105,7 @@ class TelegramScraper:
         store: Store,
         headless: bool = False,
         poll_interval: int = 20,
+        run_lock: Optional[asyncio.Lock] = None,   # <-- NEW
     ):
         self.phone = phone
         self.transformer = transformer
@@ -112,6 +114,7 @@ class TelegramScraper:
         self.store = store
         self.headless = headless
         self.poll_interval = poll_interval
+        self.run_lock = run_lock or asyncio.Lock()   # <-- NEW
 
         self.context: BrowserContext | None = None
         self._page: Page | None = None
@@ -189,10 +192,6 @@ class TelegramScraper:
         await asyncio.sleep(2)
 
         # Wait for code input (maybe)
-        # User must enter the code via the browser, or we can automate with a phone code
-        # For simplicity, we'll wait up to 60 seconds for the user to manually enter code
-        # Alternatively, we could use Telegram client to get code and auto-fill, but that's complex.
-        # We'll ask the user to complete login manually.
         logger.warning("Please complete the login (enter SMS code/2FA) in the browser window. Waiting up to 60 seconds...")
         for _ in range(60):
             await asyncio.sleep(1)
@@ -362,7 +361,7 @@ class TelegramScraper:
         return None
 
     # ------------------------------------------------------------------
-    # Polling loop
+    # Polling loop (with locking)
     # ------------------------------------------------------------------
     async def poll_channels(self, sources: list[tuple[str, str | None]]):
         """Poll a list of (channel_id, username) sources that require scraping."""
@@ -370,36 +369,63 @@ class TelegramScraper:
             raise RuntimeError("Scraper not started.")
         logger.info(f"Polling {len(sources)} Telegram channels for scraping.")
         poll_count = 0
+
         while self._running:
-            poll_count += 1
-            for channel_id, username in sources:
-                # Rate limit per channel
-                now = time.time()
-                if now - self._last_poll.get(channel_id, 0) < self.poll_interval:
-                    continue
-                self._last_poll[channel_id] = now
-                try:
-                    msgs = await self.fetch_new_messages(channel_id, username)
-                    if msgs:
-                        logger.info(f"Got {len(msgs)} new scraped messages from {channel_id}")
-                        for msg in msgs:
-                            # Build SourceInfo
-                            info = SourceInfo(
-                                platform="telegram",
-                                channel_id=channel_id,
-                                channel_name=username or channel_id,
-                                author="Scraped User"
-                            )
-                            # Wrap the message dict so it looks like a Telegram message? We'll create a simple object.
-                            # The callback expects a message object with id, attachments, etc.
-                            class MsgWrapper:
-                                def __init__(self, d):
-                                    self.id = d["id"]
-                                    self.attachments = d["attachments"]
-                                    self.text = d["text"]
-                            wrapper = MsgWrapper(msg)
-                            await self.on_message(wrapper, info)
-                except Exception as e:
-                    logger.exception(f"Error polling channel {channel_id}: {e}")
-                    await asyncio.sleep(5)
-            await asyncio.sleep(5)  # small pause between polls
+            # Acquire the shared lock – only one scraper at a time
+            async with self.run_lock:
+                poll_count += 1
+                logger.info(f"=== Telegram Poll cycle #{poll_count} ===")
+
+                for channel_id, username in sources:
+                    # Rate limit per channel
+                    now = time.time()
+                    if now - self._last_poll.get(channel_id, 0) < self.poll_interval:
+                        continue
+                    self._last_poll[channel_id] = now
+
+                    try:
+                        msgs = await self.fetch_new_messages(channel_id, username)
+                        if msgs:
+                            logger.info(f"Got {len(msgs)} new scraped messages from {channel_id}")
+                            for msg in msgs:
+                                info = SourceInfo(
+                                    platform="telegram",
+                                    channel_id=channel_id,
+                                    channel_name=username or channel_id,
+                                    author="Scraped User"
+                                )
+                                # Wrap the message dict
+                                class MsgWrapper:
+                                    def __init__(self, d):
+                                        self.id = d["id"]
+                                        self.attachments = d["attachments"]
+                                        self.text = d["text"]
+                                wrapper = MsgWrapper(msg)
+                                await self.on_message(wrapper, info)
+                    except Exception as e:
+                        logger.exception(f"Error polling channel {channel_id}: {e}")
+                        await asyncio.sleep(5)
+
+                # Periodically restart page to free memory
+                if poll_count % 5 == 0 and self._page:
+                    try:
+                        await self._page.close()
+                    except Exception:
+                        pass
+                    self._page = await self.context.new_page()
+                    gc.collect()
+                    logger.info("Telegram page restarted to free memory")
+
+            # Sleep outside the lock so other scrapers can run
+            await asyncio.sleep(5)  # small pause between poll cycles
+
+    # ------------------------------------------------------------------
+    # Stop
+    # ------------------------------------------------------------------
+    async def stop(self):
+        self._running = False
+        if self._page:
+            await self._page.close()
+        if self.context:
+            await self.context.close()
+        logger.info("Telegram scraper stopped.")
