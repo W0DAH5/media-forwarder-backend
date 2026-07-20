@@ -1,10 +1,5 @@
-import sys
-from pathlib import Path
-
-# Add the src directory to Python's module search path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
-
-from media_forwarder.app import main
+# main.py
+from src.app import main
 
 if __name__ == "__main__":
     main()
