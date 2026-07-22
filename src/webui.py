@@ -56,8 +56,8 @@ class WebDashboard:
         self.app.router.add_post(r"/api/sources/{channel_id:.+}/disable", self.api_disable_source)
         self.app.router.add_post(r"/api/sources/{channel_id:.+}/filters", self.api_update_filters)
         self.app.router.add_post(r"/api/sources/{channel_id:.+}/start_date", self.api_update_source_start_date)
-        self.app.router.add_post(r"/api/sources/{channel_id:.+}/method", self.api_update_forwarding_method)   # <-- NEW
-        self.app.router.add_post(r"/api/sources/{channel_id:.+}/username", self.api_set_username)             # <-- NEW
+        self.app.router.add_post(r"/api/sources/{channel_id:.+}/method", self.api_update_forwarding_method)
+        self.app.router.add_post(r"/api/sources/{channel_id:.+}/username", self.api_set_username)
         self.app.router.add_post("/api/forwarding", self.api_forwarding)
         self.app.router.add_post("/api/backfill", self.api_backfill)
         self.app.router.add_get("/api/tasks", self.api_tasks)
@@ -119,15 +119,14 @@ class WebDashboard:
         )
 
     async def api_sources(self, request: web.Request) -> web.Response:
-        """Return all sources with additional fields (scrape_required, last_scraped_id, forwarding_method)."""
+        """Return all sources with additional fields."""
         sources = self.forwarder.store.get_sources()
         result = []
         for s in sources:
             d = s.__dict__.copy()
+            d["forwarding_method"] = s.filters.get("forwarding_method", "auto")
             d["scrape_required"] = s.scrape_required
             d["last_scraped_id"] = s.last_scraped_id
-            # forwarding_method is stored inside filters
-            d["forwarding_method"] = s.filters.get("forwarding_method", "auto")
             result.append(d)
         return web.json_response({"ok": True, "sources": result})
 
@@ -139,16 +138,28 @@ class WebDashboard:
         if isinstance(filters, str):
             filters = json.loads(filters or "{}")
         start_date = data.get("start_date") or None
-        # Allow passing forwarding_method and username in filters
-        if "forwarding_method" in data:
-            filters["forwarding_method"] = data["forwarding_method"]
-        if "username" in data:
-            filters["username"] = data["username"]
+
+        # Extract forwarding method and username from data or filters
+        forwarding_method = data.get("forwarding_method") or filters.get("forwarding_method", "auto")
+        username = data.get("username") or filters.get("username")
+        if username:
+            filters["username"] = username
+        if forwarding_method:
+            filters["forwarding_method"] = forwarding_method
+
         channel_id = await self.forwarder.normalize_channel_id(platform, raw_channel)
-        self.forwarder.store.add_source(platform, channel_id, filters, start_date)
-        # If forwarding_method is 'scrape', set scrape_required
-        if filters.get("forwarding_method") == "scrape":
-            self.forwarder.store.set_scrape_required(channel_id, True)
+
+        # Determine scrape_required
+        scrape_required = data.get("scrape_required", False) or (forwarding_method == "scrape")
+
+        self.forwarder.store.add_source(
+            platform=platform,
+            channel_id=channel_id,
+            filters=filters,
+            start_date=start_date,
+            forwarding_method=forwarding_method,
+            scrape_required=scrape_required,
+        )
         return web.json_response({"ok": True, "channel_id": channel_id})
 
     async def api_remove_source(self, request: web.Request) -> web.Response:
@@ -169,13 +180,35 @@ class WebDashboard:
     async def api_update_filters(self, request: web.Request) -> web.Response:
         channel_id = unquote(request.match_info["channel_id"])
         data = await self.json_body(request)
-        filters = data.get("filters") or {}
-        if isinstance(filters, str):
-            filters = json.loads(filters or "{}")
+        new_filters = data.get("filters") or {}
+        if isinstance(new_filters, str):
+            new_filters = json.loads(new_filters or "{}")
+
         src = self.forwarder.store.get_source(channel_id)
         if not src:
             return web.json_response({"ok": False, "error": "source not found"}, status=404)
-        self.forwarder.store.add_source(src.platform, channel_id, filters, src.start_date)
+
+        # Preserve existing forwarding method and scrape_required unless overridden
+        forwarding_method = new_filters.get("forwarding_method") or src.filters.get("forwarding_method", "auto")
+        scrape_required = src.scrape_required
+        # If method is 'scrape' in new filters, set scrape_required True
+        if forwarding_method == "scrape":
+            scrape_required = True
+
+        # Merge filters: update only provided keys, keep rest
+        merged_filters = src.filters.copy()
+        merged_filters.update(new_filters)
+        # Ensure forwarding_method is set correctly
+        merged_filters["forwarding_method"] = forwarding_method
+
+        self.forwarder.store.add_source(
+            platform=src.platform,
+            channel_id=channel_id,
+            filters=merged_filters,
+            start_date=src.start_date,
+            forwarding_method=forwarding_method,
+            scrape_required=scrape_required,
+        )
         self.forwarder.store.set_source_enabled(channel_id, src.enabled)
         return web.json_response({"ok": True})
 
@@ -188,10 +221,25 @@ class WebDashboard:
                 datetime.fromisoformat(date_str)
             except ValueError:
                 return web.json_response({"ok": False, "error": "Invalid date format. Use YYYY-MM-DD"}, status=400)
-        self.forwarder.store.update_source_start_date(channel_id, date_str)
-        # Reset seen messages for this channel so old messages become eligible
+
+        src = self.forwarder.store.get_source(channel_id)
+        if not src:
+            return web.json_response({"ok": False, "error": "source not found"}, status=404)
+
+        # Update only start_date, preserve everything else
+        self.forwarder.store.add_source(
+            platform=src.platform,
+            channel_id=channel_id,
+            filters=src.filters,
+            start_date=date_str,
+            forwarding_method=src.filters.get("forwarding_method", "auto"),
+            scrape_required=src.scrape_required,
+        )
+
+        # Reset seen messages for this channel (if Discord scraper)
         if self.forwarder.discord_scraper:
             self.forwarder.discord_scraper.reset_seen(channel_id)
+
         return web.json_response({"ok": True, "start_date": date_str})
 
     # ---------- New endpoints for forwarding method and username ----------
@@ -201,16 +249,27 @@ class WebDashboard:
         method = data.get("method")  # 'auto', 'api', 'scrape'
         if method not in ("auto", "api", "scrape"):
             return web.json_response({"ok": False, "error": "method must be auto, api, or scrape"}, status=400)
+
         src = self.forwarder.store.get_source(channel_id)
         if not src:
             return web.json_response({"ok": False, "error": "source not found"}, status=404)
+
         # Update filters with new method
-        filters = src.filters or {}
+        filters = src.filters.copy()
         filters["forwarding_method"] = method
-        self.forwarder.store.add_source(src.platform, channel_id, filters, src.start_date)
-        # If method is 'scrape', also set scrape_required to True
+
+        scrape_required = src.scrape_required
         if method == "scrape":
-            self.forwarder.store.set_scrape_required(channel_id, True)
+            scrape_required = True
+
+        self.forwarder.store.add_source(
+            platform=src.platform,
+            channel_id=channel_id,
+            filters=filters,
+            start_date=src.start_date,
+            forwarding_method=method,
+            scrape_required=scrape_required,
+        )
         return web.json_response({"ok": True})
 
     async def api_set_username(self, request: web.Request) -> web.Response:
@@ -219,16 +278,27 @@ class WebDashboard:
         username = data.get("username")
         if not username:
             return web.json_response({"ok": False, "error": "username required"}, status=400)
+
         src = self.forwarder.store.get_source(channel_id)
         if not src:
             return web.json_response({"ok": False, "error": "source not found"}, status=404)
-        filters = src.filters or {}
+
+        filters = src.filters.copy()
         filters["username"] = username.strip()
-        self.forwarder.store.add_source(src.platform, channel_id, filters, src.start_date)
+
+        self.forwarder.store.add_source(
+            platform=src.platform,
+            channel_id=channel_id,
+            filters=filters,
+            start_date=src.start_date,
+            forwarding_method=src.filters.get("forwarding_method", "auto"),
+            scrape_required=src.scrape_required,
+        )
         return web.json_response({"ok": True})
 
     # ------------------------------------------------------------------
-
+    # Remaining endpoints (unchanged)
+    # ------------------------------------------------------------------
     async def api_forwarding(self, request: web.Request) -> web.Response:
         data = await self.json_body(request)
         action = data.get("action")

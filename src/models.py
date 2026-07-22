@@ -11,9 +11,12 @@ class SourceChannel:
     platform: str
     channel_id: str
     enabled: bool = True
+    forwarding_method: str = "auto"   # NEW: 'auto', 'api', or 'scrape'
     filters: dict[str, Any] = field(default_factory=dict)
-    start_date: str | None = None   # ISO date, e.g., "2025-01-01"
+    start_date: str | None = None
     created_at: str | None = None
+    scrape_required: bool = False
+    last_scraped_id: str | None = None
 
 
 @dataclass

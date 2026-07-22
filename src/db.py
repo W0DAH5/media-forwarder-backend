@@ -94,13 +94,18 @@ class Store:
     ) -> None:
         if platform not in {"telegram", "discord"}:
             raise ValueError("platform must be 'telegram' or 'discord'")
+
+        # Preserve last_scraped_id if source already exists
+        existing = self.get_source(channel_id)
+        last_scraped_id = existing.last_scraped_id if existing else None
+
         with self.lock, self.conn:
             self.conn.execute(
                 """
                 INSERT OR REPLACE INTO sources(
                     platform, channel_id, enabled, filters, start_date,
-                    created_at, forwarding_method, scrape_required
-                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                    created_at, forwarding_method, last_scraped_id, scrape_required
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     platform,
@@ -109,6 +114,7 @@ class Store:
                     start_date,
                     utcnow_iso(),
                     forwarding_method,
+                    last_scraped_id,
                     1 if scrape_required else 0,
                 ),
             )
@@ -159,17 +165,19 @@ class Store:
 
     @staticmethod
     def _source_from_row(row: sqlite3.Row) -> SourceChannel:
+        # Convert to dict to safely access fields (row has .get() but this is safer)
+        d = dict(row)
         return SourceChannel(
-            id=row["id"],
-            platform=row["platform"],
-            channel_id=row["channel_id"],
-            enabled=bool(row["enabled"]),
-            filters=json.loads(row["filters"] or "{}"),
-            start_date=row["start_date"] if row["start_date"] else None,
-            created_at=row["created_at"],
-            forwarding_method=row.get("forwarding_method", "auto"),
-            last_scraped_id=row.get("last_scraped_id"),
-            scrape_required=bool(row.get("scrape_required", 0)),
+            id=d["id"],
+            platform=d["platform"],
+            channel_id=d["channel_id"],
+            enabled=bool(d["enabled"]),
+            filters=json.loads(d.get("filters", "{}")),
+            start_date=d.get("start_date"),
+            created_at=d["created_at"],
+            forwarding_method=d.get("forwarding_method", "auto"),
+            last_scraped_id=d.get("last_scraped_id"),
+            scrape_required=bool(d.get("scrape_required", 0)),
         )
 
     # ----- progress -----
@@ -286,6 +294,11 @@ class Store:
             cur = self.conn.execute(
                 "UPDATE queue SET status='queued', updated_at=? WHERE status='failed'", (utcnow_iso(),)
             )
+            return cur.rowcount
+
+    def clear_queue(self) -> int:
+        with self.lock, self.conn:
+            cur = self.conn.execute("DELETE FROM queue")
             return cur.rowcount
 
     def queue_size(self, status: str = "queued") -> int:
