@@ -1,6 +1,3 @@
-I've added the missing `/api/destination` endpoint to `webui.py`. The route is registered in `_routes()` after the Discord discovery endpoint, and the handler `api_set_destination` updates the in‑memory destination channel ID and forces a refresh of the destination entity.
-
-```python
 from __future__ import annotations
 
 import asyncio
@@ -658,4 +655,3 @@ refresh();loadSources();setInterval(refresh,5000);setInterval(()=>{if(document.g
 </body>
 </html>
 """
-```
