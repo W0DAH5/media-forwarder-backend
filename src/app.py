@@ -136,7 +136,7 @@ class MediaForwarder:
                 headless=not settings.discord_show_browser,
                 start_date=settings.discord_start_date,
                 store=self.store,
-                run_lock=self._scraper_lock,   # <-- pass shared lock
+                run_lock=self._scraper_lock,
             )
             for ch in channels:
                 if not self.store.get_source(ch):
@@ -156,7 +156,7 @@ class MediaForwarder:
                 store=self.store,
                 headless=not settings.telegram_show_browser,
                 poll_interval=settings.telegram_scraper_poll_interval,
-                run_lock=self._scraper_lock,   # <-- pass shared lock
+                run_lock=self._scraper_lock,
             )
             logger.info("Telegram scraper initialized.")
 
@@ -164,6 +164,9 @@ class MediaForwarder:
         self.forwarding_enabled = True
         self.web_dashboard: WebDashboard | None = None
         self._dest_entity = None
+
+        # Dynamic destination channel ID (set via web UI)
+        self.destination_channel_id = None
 
         self._register_telegram_handlers()
 
@@ -422,9 +425,12 @@ class MediaForwarder:
     async def _get_destination(self):
         if self._dest_entity is not None:
             return self._dest_entity
-        raw_id = self.settings.destination_channel_id
+
+        # Use dynamic destination if set, otherwise fallback to settings
+        raw_id = self.destination_channel_id or str(self.settings.destination_channel_id)
+
         # Try with -100 prefix for supergroups / channels
-        if 0 < raw_id < 10 ** 15:
+        if 0 < int(raw_id) < 10 ** 15 if isinstance(raw_id, (int, str)) and str(raw_id).lstrip('-').isdigit() else False:
             try:
                 self._dest_entity = await self.telegram.get_entity(
                     int(f"-100{raw_id}")
@@ -436,6 +442,8 @@ class MediaForwarder:
                 return self._dest_entity
             except Exception:
                 pass
+
+        # Direct resolution (works for @usernames, numeric IDs, etc.)
         self._dest_entity = await self.telegram.get_entity(raw_id)
         log_safe_app(logger.info, f"Destination entity resolved: {self._dest_entity}")
         return self._dest_entity

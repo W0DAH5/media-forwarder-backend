@@ -1,3 +1,4 @@
+# webui.py
 from __future__ import annotations
 
 import asyncio
@@ -69,10 +70,8 @@ class WebDashboard:
         self.app.router.add_post("/api/scraper/toggle", self.api_toggle_scraper)
         self.app.router.add_get("/api/discovery/telegram", self.api_discover_telegram)
         self.app.router.add_get("/api/discovery/discord", self.api_discover_discord)
-        # NEW: version endpoint for update checks
-        self.app.router.add_get("/api/version", self.api_version)
-        # NEW: endpoint to set destination channel
-        self.app.router.add_post("/api/destination", self.api_set_destination)
+        self.app.router.add_get("/api/version", self.api_version)               # update check endpoint
+        self.app.router.add_post("/api/destination", self.api_set_destination)  # fixed: stores as string
 
     async def start(self) -> None:
         self.runner = web.AppRunner(self.app)
@@ -142,7 +141,6 @@ class WebDashboard:
             filters = json.loads(filters or "{}")
         start_date = data.get("start_date") or None
 
-        # Extract forwarding method and username from data or filters
         forwarding_method = data.get("forwarding_method") or filters.get("forwarding_method", "auto")
         username = data.get("username") or filters.get("username")
         if username:
@@ -151,8 +149,6 @@ class WebDashboard:
             filters["forwarding_method"] = forwarding_method
 
         channel_id = await self.forwarder.normalize_channel_id(platform, raw_channel)
-
-        # Determine scrape_required
         scrape_required = data.get("scrape_required", False) or (forwarding_method == "scrape")
 
         self.forwarder.store.add_source(
@@ -191,13 +187,11 @@ class WebDashboard:
         if not src:
             return web.json_response({"ok": False, "error": "source not found"}, status=404)
 
-        # Preserve existing forwarding method and scrape_required unless overridden
         forwarding_method = new_filters.get("forwarding_method") or src.filters.get("forwarding_method", "auto")
         scrape_required = src.scrape_required
         if forwarding_method == "scrape":
             scrape_required = True
 
-        # Merge filters: update only provided keys, keep rest
         merged_filters = src.filters.copy()
         merged_filters.update(new_filters)
         merged_filters["forwarding_method"] = forwarding_method
@@ -227,7 +221,6 @@ class WebDashboard:
         if not src:
             return web.json_response({"ok": False, "error": "source not found"}, status=404)
 
-        # Update only start_date, preserve everything else
         self.forwarder.store.add_source(
             platform=src.platform,
             channel_id=channel_id,
@@ -237,17 +230,15 @@ class WebDashboard:
             scrape_required=src.scrape_required,
         )
 
-        # Reset seen messages for this channel (if Discord scraper)
         if self.forwarder.discord_scraper:
             self.forwarder.discord_scraper.reset_seen(channel_id)
 
         return web.json_response({"ok": True, "start_date": date_str})
 
-    # ---------- New endpoints for forwarding method and username ----------
     async def api_update_forwarding_method(self, request: web.Request) -> web.Response:
         channel_id = unquote(request.match_info["channel_id"])
         data = await self.json_body(request)
-        method = data.get("method")  # 'auto', 'api', 'scrape'
+        method = data.get("method")
         if method not in ("auto", "api", "scrape"):
             return web.json_response({"ok": False, "error": "method must be auto, api, or scrape"}, status=400)
 
@@ -257,7 +248,6 @@ class WebDashboard:
 
         filters = src.filters.copy()
         filters["forwarding_method"] = method
-
         scrape_required = src.scrape_required
         if method == "scrape":
             scrape_required = True
@@ -296,21 +286,20 @@ class WebDashboard:
         )
         return web.json_response({"ok": True})
 
-    # ---------- Version endpoint for mobile app updates ----------
+    # ---------- Version endpoint ----------
     async def api_version(self, request: web.Request) -> web.Response:
-        # Read version from environment variable or fallback
         version = os.environ.get("APP_VERSION", "1.0.1")
         return web.json_response({"version": version})
 
-    # ---------- New endpoint to set destination channel ----------
+    # ---------- Fixed destination endpoint (stores as string) ----------
     async def api_set_destination(self, request: web.Request) -> web.Response:
         data = await self.json_body(request)
         channel_id = data.get("channel_id")
         if not channel_id:
             return web.json_response({"ok": False, "error": "channel_id required"}, status=400)
-        # Update in-memory destination
-        self.forwarder.settings.destination_channel_id = int(channel_id)
-        self.forwarder._dest_entity = None  # force refresh
+        # Store as string – accepts numeric IDs, @usernames, etc.
+        self.forwarder.destination_channel_id = channel_id
+        self.forwarder._dest_entity = None
         return web.json_response({"ok": True})
 
     # ------------------------------------------------------------------
@@ -373,7 +362,9 @@ class WebDashboard:
         text = str(data.get("text", "")).strip()
         if not text:
             return web.json_response({"ok": False, "error": "text is required"}, status=400)
-        await self.forwarder.telegram.send_message(self.settings.destination_channel_id, text[:4096])
+        # Use the dynamic destination (if set) or fallback to settings
+        dest = self.forwarder.destination_channel_id or str(self.forwarder.settings.destination_channel_id)
+        await self.forwarder.telegram.send_message(dest, text[:4096])
         return web.json_response({"ok": True})
 
     async def api_config(self, request: web.Request) -> web.Response:
@@ -406,7 +397,6 @@ class WebDashboard:
                 datetime.fromisoformat(date_str)
             except ValueError:
                 return web.json_response({"ok": False, "error": "Invalid date format. Use YYYY-MM-DD"}, status=400)
-        # Update .env
         env_path = Path(".env")
         if env_path.exists():
             lines = env_path.read_text().splitlines()
