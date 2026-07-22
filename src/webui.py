@@ -70,8 +70,8 @@ class WebDashboard:
         self.app.router.add_post("/api/scraper/toggle", self.api_toggle_scraper)
         self.app.router.add_get("/api/discovery/telegram", self.api_discover_telegram)
         self.app.router.add_get("/api/discovery/discord", self.api_discover_discord)
-        self.app.router.add_get("/api/version", self.api_version)               # update check endpoint
-        self.app.router.add_post("/api/destination", self.api_set_destination)  # fixed: stores as string
+        self.app.router.add_get("/api/version", self.api_version)
+        self.app.router.add_post("/api/destination", self.api_set_destination)
 
     async def start(self) -> None:
         self.runner = web.AppRunner(self.app)
@@ -136,6 +136,9 @@ class WebDashboard:
         data = await self.json_body(request)
         platform = str(data.get("platform", "")).lower()
         raw_channel = str(data.get("channel", "")).strip()
+        if not raw_channel:
+            return web.json_response({"ok": False, "error": "channel is required"}, status=400)
+
         filters = data.get("filters") or {}
         if isinstance(filters, str):
             filters = json.loads(filters or "{}")
@@ -148,7 +151,11 @@ class WebDashboard:
         if forwarding_method:
             filters["forwarding_method"] = forwarding_method
 
-        channel_id = await self.forwarder.normalize_channel_id(platform, raw_channel)
+        try:
+            channel_id = await self.forwarder.normalize_channel_id(platform, raw_channel)
+        except ValueError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+
         scrape_required = data.get("scrape_required", False) or (forwarding_method == "scrape")
 
         self.forwarder.store.add_source(
