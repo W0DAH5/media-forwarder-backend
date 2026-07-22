@@ -1,4 +1,6 @@
-# webui.py
+I've added the missing `/api/destination` endpoint to `webui.py`. The route is registered in `_routes()` after the Discord discovery endpoint, and the handler `api_set_destination` updates the in‑memory destination channel ID and forces a refresh of the destination entity.
+
+```python
 from __future__ import annotations
 
 import asyncio
@@ -70,6 +72,10 @@ class WebDashboard:
         self.app.router.add_post("/api/scraper/toggle", self.api_toggle_scraper)
         self.app.router.add_get("/api/discovery/telegram", self.api_discover_telegram)
         self.app.router.add_get("/api/discovery/discord", self.api_discover_discord)
+        # NEW: version endpoint for update checks
+        self.app.router.add_get("/api/version", self.api_version)
+        # NEW: endpoint to set destination channel
+        self.app.router.add_post("/api/destination", self.api_set_destination)
 
     async def start(self) -> None:
         self.runner = web.AppRunner(self.app)
@@ -191,14 +197,12 @@ class WebDashboard:
         # Preserve existing forwarding method and scrape_required unless overridden
         forwarding_method = new_filters.get("forwarding_method") or src.filters.get("forwarding_method", "auto")
         scrape_required = src.scrape_required
-        # If method is 'scrape' in new filters, set scrape_required True
         if forwarding_method == "scrape":
             scrape_required = True
 
         # Merge filters: update only provided keys, keep rest
         merged_filters = src.filters.copy()
         merged_filters.update(new_filters)
-        # Ensure forwarding_method is set correctly
         merged_filters["forwarding_method"] = forwarding_method
 
         self.forwarder.store.add_source(
@@ -254,7 +258,6 @@ class WebDashboard:
         if not src:
             return web.json_response({"ok": False, "error": "source not found"}, status=404)
 
-        # Update filters with new method
         filters = src.filters.copy()
         filters["forwarding_method"] = method
 
@@ -294,6 +297,23 @@ class WebDashboard:
             forwarding_method=src.filters.get("forwarding_method", "auto"),
             scrape_required=src.scrape_required,
         )
+        return web.json_response({"ok": True})
+
+    # ---------- Version endpoint for mobile app updates ----------
+    async def api_version(self, request: web.Request) -> web.Response:
+        # Read version from environment variable or fallback
+        version = os.environ.get("APP_VERSION", "1.0.1")
+        return web.json_response({"version": version})
+
+    # ---------- New endpoint to set destination channel ----------
+    async def api_set_destination(self, request: web.Request) -> web.Response:
+        data = await self.json_body(request)
+        channel_id = data.get("channel_id")
+        if not channel_id:
+            return web.json_response({"ok": False, "error": "channel_id required"}, status=400)
+        # Update in-memory destination
+        self.forwarder.settings.destination_channel_id = int(channel_id)
+        self.forwarder._dest_entity = None  # force refresh
         return web.json_response({"ok": True})
 
     # ------------------------------------------------------------------
@@ -638,3 +658,4 @@ refresh();loadSources();setInterval(refresh,5000);setInterval(()=>{if(document.g
 </body>
 </html>
 """
+```
